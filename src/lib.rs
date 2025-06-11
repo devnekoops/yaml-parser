@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::f32::consts::E;
 use std::fmt;
 
 
@@ -103,7 +102,51 @@ impl Lexer {
         Token::Comment(comment.trim().to_string())
     }
 
+    fn measure_indent(&mut self) -> usize{
+        let start_pos = self.position;
+        while matches!(self.current_char(), ' ' | '\t') {
+            self.advance();
+        }
+        self.position - start_pos
+    }
+
     fn read_key_value(&mut self) -> Result<Option<Token>> {
+        let start_pos = self.position;
+
+        // read key
+        while !matches!(self.current_char(), ':' | '\n' | '\0') {
+            self.advance();
+        }
+
+        if self.current_char() != ':' {
+            return Ok(None)
+        }
+
+        let key = self.input[start_pos..self.position]
+                              .iter()
+                              .collect::<String>()
+                              .trim()
+                              .to_string();
+        self.advance();
+        self.skip_whitespace_except_newline();
+
+        // read value
+        let value_start = self.position;
+        while !matches!(self.current_char(), '\n' | '\0') {
+            self.advance();
+        }
+
+        let value = if value_start == self.position{
+            String::new()
+        } else {
+            self.input[value_start..self.position]
+            .iter()
+            .collect::<String>()
+            .trim()
+            .to_string()
+        };
+        
+        Ok(Some(Token::Key(format!("{} : {}", key, value))))
     }
 
 
@@ -138,9 +181,13 @@ impl Lexer {
                         tokens.push(Token::Indent(indent));
                     }
 
-                    if let Some(token) = self.read
+                    if let Some(token) = self.read_key_value()? {
+                        tokens.push(token);
+                    }
                 }
             }
-        }    
+        }
+        tokens.push(Token::Eof);
+        Ok(tokens)
     }
 }
