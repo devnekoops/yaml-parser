@@ -1,0 +1,30 @@
+company:
+  name: "Tech Solutions Inc."
+  location: "Silicon Valley"
+  employees:
+    - id: A001
+      name: John Doe
+      department: Engineering
+      skills: ["Rust", "Python", "Docker"]
+      is_manager: true
+    - id: B002
+      name: Jane Smith
+      department: Marketing
+      skills: ["SEO", "Content Creation"]
+      is_manager: false
+  projects:
+    - name: Project Alpha
+      status: In Progress
+      budget: 150000.75
+      team_members:
+        - John Doe
+        - Jane Smith
+    - name: Project Beta
+      status: Completed
+      budget: 50000.00
+      team_members:
+        - Mike Johnson
+  contact_info:
+    email: info@techsolutions.com
+    phone: "123-456-7890"
+    website: "https://www.techsolutions.com"
