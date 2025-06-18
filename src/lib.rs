@@ -6,7 +6,7 @@ use std::fmt;
 pub enum YamlValue {
     String(String),
     Integer(i64),
-    Fload(f64),
+    Float(f64),
     Boolean(bool),
     Array(Vec<YamlValue>),
     Object(HashMap<String, YamlValue>),
@@ -62,7 +62,7 @@ impl Lexer {
             input: input.chars().collect(),
             position: 0,
             line:1,
-            column: 1,
+            column: 1
         }
     }
 
