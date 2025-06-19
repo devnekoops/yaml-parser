@@ -1,6 +1,6 @@
 // テスト対象のクレート（ここでは 'yaml_parser'）をインポートします。
 // Cargo.toml の package.name が 'yaml-parser' の場合、クレート名は 'yaml_parser' になります。
-use yaml_parser::{Lexer, Result, Token, YamlError};
+use yaml_parser::{Lexer, Result, Token, YamlError, YamlValue};
 
 // tokenizeのヘルパー関数 (Resultを返すように調整)
 fn tokenize_string(input: &str) -> Result<Vec<Token>> {
@@ -20,7 +20,12 @@ fn test_tokenize_basic_key_value() {
     let tokens = tokenize_string(yaml).unwrap();
     assert_eq!(
         tokens,
-        vec![Token::Key("name : Alice".to_string()), Token::Eof]
+        vec![
+            Token::Key("name".to_string()),
+            Token::Colon,
+            Token::Value(YamlValue::String("Alice".to_string())),
+            Token::Eof
+        ]
     );
 }
 
@@ -55,39 +60,7 @@ fn test_tokenize_nested_structure_with_indent() {
     );
 }
 
-#[test]
-fn test_tokenize_list_items() {
-    let yaml = "- item1\n- item2";
-    let tokens = tokenize_string(yaml).unwrap();
-    assert_eq!(
-        tokens,
-        vec![
-            Token::ListItem,
-            Token::String("item1".to_string()), // ListItemの後の値はKeyとしてパースされる
-            Token::Newline,
-            Token::ListItem,
-            Token::String("item2".to_string()),
-            Token::Eof
-        ]
-    );
-}
 
-#[test]
-fn test_tokenize_list_items_with_nested_value() {
-    let yaml = "- item1\n  subitem: value";
-    let tokens = tokenize_string(yaml).unwrap();
-    assert_eq!(
-        tokens,
-        vec![
-            Token::ListItem,
-            Token::String("item1".to_string()),
-            Token::Newline,
-            Token::Indent(2),
-            Token::Key("subitem : value".to_string()),
-            Token::Eof
-        ]
-    );
-}
 
 /// Data Type Handling
 

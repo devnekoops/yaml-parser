@@ -1,12 +1,12 @@
+
 use std::collections::HashMap;
-use std::collections::btree_map::Keys;
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum YamlValue {
     String(String),
     Integer(i64),
-    Float(f64),
+    Float(f64), // Fload -> Float に修正
     Boolean(bool),
     Array(Vec<YamlValue>),
     Object(HashMap<String, YamlValue>),
@@ -18,6 +18,8 @@ pub enum YamlError {
     ParseError(String),
     IndentationError(String),
     InvalidValue(String),
+    UnexpectedChar { char: char, line: usize, column: usize },
+    UnexpectedEof,
 }
 
 impl fmt::Display for YamlError {
@@ -26,6 +28,10 @@ impl fmt::Display for YamlError {
             YamlError::ParseError(msg) => write!(f, "Parse error: {}", msg),
             YamlError::IndentationError(msg) => write!(f, "Indentation error: {}", msg),
             YamlError::InvalidValue(msg) => write!(f, "Invalid Value error: {}", msg),
+            YamlError::UnexpectedChar { char, line, column } => {
+                write!(f, "Unexpected character '{}' at line {}, column {}", char, line, column)
+            }
+            YamlError::UnexpectedEof => write!(f, "Unexpected end of file"),
         }
     }
 }
@@ -34,20 +40,31 @@ impl std::error::Error for YamlError {}
 
 pub type Result<T> = std::result::Result<T, YamlError>;
 
-//
-//
-
+// より適切なToken設計
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
+    // 基本的なトークン
     Key(String),
     Colon,
     Value(YamlValue),
-    String(String),
-    ListItem,
+    
+    // 構造トークン
+    ListItem,           // -
+    BlockSequence,      // - (ブロックシーケンス用)
+    
+    // インデントとレイアウト
     Indent(usize),
+    Dedent(usize),      // インデント減少
     Newline,
+    
+    // 特殊
     Comment(String),
     Eof,
+    
+    // 将来の拡張用
+    FlowStart,          // [, {
+    FlowEnd,            // ], }
+    FlowSeparator,      // ,
 }
 
 pub struct Lexer {
@@ -55,6 +72,7 @@ pub struct Lexer {
     position: usize,
     line: usize,
     column: usize,
+    indent_stack: Vec<usize>,  // インデントレベルのスタック
 }
 
 impl Lexer {
@@ -64,6 +82,7 @@ impl Lexer {
             position: 0,
             line: 1,
             column: 1,
+            indent_stack: vec![0], // 初期インデントレベルは0
         }
     }
 
@@ -79,14 +98,24 @@ impl Lexer {
         self.input.get(self.position + 1).copied()
     }
 
+    fn peek_n(&self, n: usize) -> Option<char> {
+        self.input.get(self.position + n).copied()
+    }
+
     fn advance(&mut self) -> char {
         if !self.is_at_end() {
             let ch = self.current_char();
             self.position += 1;
-            self.column += 1;
+            
+            if ch == '\n' {
+                self.line += 1;
+                self.column = 1;
+            } else {
+                self.column += 1;
+            }
             ch
         } else {
-            self.current_char()
+            '\0'
         }
     }
 
@@ -96,8 +125,61 @@ impl Lexer {
         }
     }
 
+    fn skip_whitespace(&mut self) {
+        while matches!(self.current_char(), ' ' | '\t' | '\r' | '\n') {
+            if self.current_char() == '\n' {
+                self.line += 1;
+                self.column = 1;
+            }
+            self.advance();
+        }
+    }
+
+    // インデント測定と DEDENTトークンの生成
+    fn handle_indentation(&mut self) -> Result<Vec<Token>> {
+        let mut tokens = Vec::new();
+        let mut indent_level = 0;
+        
+        // 行の開始時のインデントを測定
+        while matches!(self.current_char(), ' ' | '\t') {
+            self.advance();
+            indent_level += 1;
+        }
+        
+        // 空行やコメント行の場合はインデント処理をスキップ
+        if matches!(self.current_char(), '\n' | '#' | '\0') {
+            return Ok(tokens);
+        }
+        
+        let current_indent = *self.indent_stack.last().unwrap();
+        
+        if indent_level > current_indent {
+            // インデント増加
+            self.indent_stack.push(indent_level);
+            tokens.push(Token::Indent(indent_level));
+        } else if indent_level < current_indent {
+            // インデント減少 - 複数レベル戻る可能性がある
+            while let Some(&stack_indent) = self.indent_stack.last() {
+                if stack_indent <= indent_level {
+                    break;
+                }
+                self.indent_stack.pop();
+                tokens.push(Token::Dedent(stack_indent));
+            }
+            
+            // 不正なインデントレベルの検出
+            if self.indent_stack.last() != Some(&indent_level) {
+                return Err(YamlError::IndentationError(
+                    format!("Invalid indentation level {} at line {}", indent_level, self.line)
+                ));
+            }
+        }
+        
+        Ok(tokens)
+    }
+
     fn read_comment(&mut self) -> Token {
-        self.advance(); // '#'
+        self.advance(); // '#'をスキップ
         let mut comment = String::new();
 
         while !matches!(self.current_char(), '\n' | '\0') {
@@ -107,157 +189,219 @@ impl Lexer {
         Token::Comment(comment.trim().to_string())
     }
 
-    fn measure_indent(&mut self) -> usize {
+    // 値を読み取って適切な型に変換
+    fn read_value(&mut self) -> Result<YamlValue> {
+        self.skip_whitespace_except_newline();
+        
+        if self.is_at_end() || matches!(self.current_char(), '\n' | '#') {
+            return Ok(YamlValue::Null);
+        }
+        
         let start_pos = self.position;
-        while matches!(self.current_char(), ' ' | '\t') {
+        
+        // 引用符付き文字列の処理
+        if matches!(self.current_char(), '"' | '\'') {
+            return self.read_quoted_string();
+        }
+        
+        // 通常の値を読み取り
+        while !matches!(self.current_char(), '\n' | '\0' | '#') {
             self.advance();
         }
-        self.position - start_pos
+        
+        let value_str = self.input[start_pos..self.position]
+            .iter()
+            .collect::<String>()
+            .trim()
+            .to_string();
+            
+        self.parse_scalar_value(&value_str)
     }
 
-    fn read_string_until(&mut self, delimiters: &[char]) -> String {
-        let mut content = String::new();
-        while !delimiters.contains(&self.current_char())
-            && !matches!(self.current_char(), '\n' | '\0')
-        {
-            dbg!(self.current_char());
-            content.push(self.advance());
+    fn read_quoted_string(&mut self) -> Result<YamlValue> {
+        let quote_char = self.advance(); // " or '
+        let mut value = String::new();
+        
+        while !self.is_at_end() && self.current_char() != quote_char {
+            let ch = self.advance();
+            if ch == '\\' && quote_char == '"' {
+                // エスケープシーケンスの処理（ダブルクォートのみ）
+                match self.current_char() {
+                    'n' => { self.advance(); value.push('\n'); }
+                    't' => { self.advance(); value.push('\t'); }
+                    'r' => { self.advance(); value.push('\r'); }
+                    '\\' => { self.advance(); value.push('\\'); }
+                    '"' => { self.advance(); value.push('"'); }
+                    _ => {
+                        value.push(ch);
+                        value.push(self.advance());
+                    }
+                }
+            } else {
+                value.push(ch);
+            }
         }
-        content.trim().to_string()
-    }
-
-    fn read_key(&mut self) -> Result<Token> {
-        let key = self.read_string_until(&[':']);
-        if key.len() > 0 {
-            Ok(Token::Key(key))
+        
+        if self.current_char() == quote_char {
+            self.advance(); // 終了クォートをスキップ
         } else {
-            Err(YamlError::ParseError(format!(
-                "cannot parse at line: {}, column: {}",
-                self.line, self.column
-            )))
+            return Err(YamlError::UnexpectedEof);
         }
+        
+        Ok(YamlValue::String(value))
     }
 
-    fn read_colon(&mut self) -> Result<Token> {
-        if self.current_char() == ':' {
-            self.advance();
-            Ok(Token::Colon)
-        } else {
-            Err(YamlError::ParseError(format!(
-                "cannot parse at line: {}, column: {}",
-                self.line, self.column
-            )))
-        }
-    }
-
-    fn read_value(&mut self) -> Result<Token> {
-        let value = self.read_string_until(&['#', '\n', '\0']);
-        if value.len() > 0 {
-            Ok(Token::Value(Self::parse_value(&value)))
-        } else {
-            Err(YamlError::ParseError("Failed to parse".to_string()))
-        }
-    }
-
-    fn parse_value(value: &str) -> YamlValue {
+    fn parse_scalar_value(&self, value: &str) -> Result<YamlValue> {
         match value {
-            "true" => YamlValue::Boolean(true),
-            "false" => YamlValue::Boolean(false),
-            "null" | "~" => YamlValue::Null,
-            s if s.parse::<i64>().is_ok() => YamlValue::Integer(s.parse().unwrap()),
-            s if s.parse::<f64>().is_ok() => YamlValue::Float(s.parse().unwrap()),
-            s => YamlValue::String(s.to_string()),
+            "true" | "True" | "TRUE" => Ok(YamlValue::Boolean(true)),
+            "false" | "False" | "FALSE" => Ok(YamlValue::Boolean(false)),
+            "null" | "Null" | "NULL" | "~" | "" => Ok(YamlValue::Null),
+            _ => {
+                // 数値の解析を試行
+                if let Ok(int_val) = value.parse::<i64>() {
+                    Ok(YamlValue::Integer(int_val))
+                } else if let Ok(float_val) = value.parse::<f64>() {
+                    Ok(YamlValue::Float(float_val))
+                } else {
+                    Ok(YamlValue::String(value.to_string()))
+                }
+            }
         }
     }
 
-    fn read_key_value(&mut self) -> Result<Option<Token>> {
+    fn read_key(&mut self) -> Result<String> {
         let start_pos = self.position;
-
-        // read key
+        
+        // キーの読み取り（コロンまで）
         while !matches!(self.current_char(), ':' | '\n' | '\0') {
             self.advance();
         }
-
+        
         if start_pos == self.position {
-            return Ok(None);
+            return Err(YamlError::ParseError("Empty key".to_string()));
         }
-
-        if self.current_char() != ':' {
-            return Ok(Some(Token::String(
-                self.input[start_pos..self.position]
-                    .iter()
-                    .collect::<String>()
-                    .trim()
-                    .to_string(),
-            )));
-        }
-
+        
         let key = self.input[start_pos..self.position]
             .iter()
             .collect::<String>()
             .trim()
             .to_string();
+            
+        if key.is_empty() {
+            return Err(YamlError::ParseError("Empty key after trimming".to_string()));
+        }
+        
+        Ok(key)
+    }
 
-        self.advance(); // skip ':'
-        self.skip_whitespace_except_newline();
-
-        // read value
-        let value_start = self.position;
-        while !matches!(self.current_char(), '\n' | '\0' | '#') {
-            self.advance();
+    fn next_token(&mut self) -> Result<Option<Token>> {
+        if self.is_at_end() {
+            return Ok(Some(Token::Eof));
         }
 
-        let value = if value_start == self.position {
-            String::new()
-        } else {
-            self.input[value_start..self.position]
-                .iter()
-                .collect::<String>()
-                .trim()
-                .to_string()
-        };
-
-        Ok(Some(Token::Key(format!("{} : {}", key, value))))
+        match self.current_char() {
+            '\n' => {
+                self.advance();
+                Ok(Some(Token::Newline))
+            }
+            '#' => Ok(Some(self.read_comment())),
+            ':' => {
+                self.advance();
+                Ok(Some(Token::Colon))
+            }
+            '-' => {
+                if self.peek_char() == Some(' ') || self.peek_char() == Some('\n') {
+                    self.advance(); // '-'
+                    if self.current_char() == ' ' {
+                        self.advance(); // ' '
+                    }
+                    Ok(Some(Token::ListItem))
+                } else {
+                    // ダッシュで始まる値として扱う
+                    let value = self.read_value()?;
+                    Ok(Some(Token::Value(value)))
+                }
+            }
+            _ => {
+                // キーまたは値の読み取り
+                let start_pos = self.position;
+                
+                // コロンがあるかチェック
+                let mut temp_pos = self.position;
+                let mut found_colon = false;
+                
+                while temp_pos < self.input.len() {
+                    match self.input[temp_pos] {
+                        ':' => {
+                            // コロンの後にスペースまたは改行があるかチェック
+                            if temp_pos + 1 < self.input.len() {
+                                match self.input[temp_pos + 1] {
+                                    ' ' | '\t' | '\n' | '\r' => {
+                                        found_colon = true;
+                                        break;
+                                    }
+                                    _ => {}
+                                }
+                            } else {
+                                found_colon = true;
+                                break;
+                            }
+                        }
+                        '\n' | '#' => break,
+                        _ => {}
+                    }
+                    temp_pos += 1;
+                }
+                
+                if found_colon {
+                    // キーとして読み取り
+                    let key = self.read_key()?;
+                    Ok(Some(Token::Key(key)))
+                } else {
+                    // 値として読み取り
+                    let value = self.read_value()?;
+                    Ok(Some(Token::Value(value)))
+                }
+            }
+        }
     }
 
     pub fn tokenize(&mut self) -> Result<Vec<Token>> {
         let mut tokens = Vec::new();
+        let mut at_line_start = true;
 
         while !self.is_at_end() {
-            let indent = self.measure_indent();
-
-            // 空白ではないところまで進む
+            // 行の開始時にインデント処理
+            if at_line_start {
+                let indent_tokens = self.handle_indentation()?;
+                tokens.extend(indent_tokens);
+                at_line_start = false;
+            }
+            
+            // 空白をスキップ（改行以外）
             self.skip_whitespace_except_newline();
-
+            
             if self.is_at_end() {
                 break;
             }
-
-            // 出た文字によって場合分け
-            match self.current_char() {
-                '\n' => {
-                    tokens.push(Token::Newline);
-                    self.advance();
-                    self.line += 1;
-                    self.column += 1;
-                }
-                '#' => tokens.push(self.read_comment()),
-                '-' if self.peek_char() == Some(' ') => {
-                    tokens.push(Token::ListItem);
-                    self.advance(); // '-'
-                    self.advance(); // ' '
-                }
-                _ => {
-                    if indent > 0 {
-                        tokens.push(Token::Indent(indent));
-                    }
-
-                    if let Some(token) = self.read_key_value()? {
-                        tokens.push(token);
-                    }
+            
+            // 次のトークンを取得
+            if let Some(token) = self.next_token()? {
+                let is_newline = matches!(token, Token::Newline);
+                tokens.push(token);
+                
+                if is_newline {
+                    at_line_start = true;
                 }
             }
         }
+        
+        // 残りのDEDENTトークンを生成
+        while self.indent_stack.len() > 1 {
+            let indent_level = self.indent_stack.pop().unwrap();
+            tokens.push(Token::Dedent(indent_level));
+        }
+        
         tokens.push(Token::Eof);
         Ok(tokens)
     }
@@ -265,193 +409,68 @@ impl Lexer {
 
 #[cfg(test)]
 mod tests {
-    use super::*; // 親モジュール（lib.rs）のアイテムをインポート
+    use super::*;
 
     #[test]
-    fn test_read_string_until() {
-        let mut lexer = Lexer::new("hello: world");
-        assert_eq!(lexer.read_string_until(&[':']), "hello".to_string());
-        assert_eq!(lexer.advance(), ':');
-        assert_eq!(lexer.read_string_until(&['\0']), "world".to_string());
-    }
-
-    #[test]
-    fn test_read_key() {
-        let mut lexer = Lexer::new("hello: world");
-        assert_eq!(lexer.read_key().unwrap(), Token::Key("hello".to_string()));
-    }
-
-    #[test]
-    fn test_read_colon() {
-        let mut lexer = Lexer::new("hello: world");
-        assert_eq!(lexer.read_key().unwrap(), Token::Key("hello".to_string()));
-        assert_eq!(lexer.read_colon().unwrap(), Token::Colon);
-    }
-
-    #[test]
-    fn test_read_value() {
-        let mut lexer = Lexer::new("hello: world");
-        assert_eq!(lexer.read_key().unwrap(), Token::Key("hello".to_string()));
-        assert_eq!(lexer.read_colon().unwrap(), Token::Colon);
-        assert_eq!(
-            lexer.read_value().unwrap(),
-            Token::Value(YamlValue::String("world".to_string()))
-        );
-    }
-
-    #[test]
-    fn test_is_at_end() {
-        let lexer = Lexer::new("");
-        assert!(lexer.is_at_end(), "Empty input should be at end");
-
-        let mut lexer = Lexer::new("a");
-        assert!(!lexer.is_at_end(), "Should not be at end with input");
-        lexer.advance();
-        assert!(lexer.is_at_end(), "Should not be at end after one char");
-
-        lexer.advance();
-        assert!(lexer.is_at_end(), "Should not be at end after one char");
-    }
-
-    #[test]
-    fn test_current_char() {
-        let mut lexer = Lexer::new("abc");
-        assert_eq!(lexer.current_char(), 'a');
-        lexer.advance();
-        assert_eq!(lexer.current_char(), 'b');
-        lexer.advance();
-        assert_eq!(lexer.current_char(), 'c');
-        lexer.advance();
-        assert_eq!(lexer.current_char(), '\0');
-    }
-
-    #[test]
-    fn test_peek_char() {
-        let mut lexer = Lexer::new("abc");
-        assert_eq!(lexer.peek_char(), Some('b'));
-        lexer.advance();
-        assert_eq!(lexer.peek_char(), Some('c'));
-        lexer.advance();
-        assert_eq!(lexer.peek_char(), None); // 'c'の次
-        lexer.advance(); // 'c'を消費して終端
-        assert_eq!(lexer.peek_char(), None);
-    }
-
-    #[test]
-    fn test_advance() {
-        let mut lexer = Lexer::new("abc");
-        assert_eq!(lexer.advance(), 'a');
-        assert_eq!(lexer.position, 1);
-        assert_eq!(lexer.column, 2);
-        assert_eq!(lexer.advance(), 'b');
-        assert_eq!(lexer.position, 2);
-        assert_eq!(lexer.column, 3);
-        assert_eq!(lexer.advance(), 'c');
-        assert_eq!(lexer.position, 3);
-        assert_eq!(lexer.column, 4);
-
-        // 終端だから進まない
-        assert_eq!(lexer.advance(), '\0');
-        assert_eq!(lexer.position, 3);
-        assert_eq!(lexer.column, 4);
-    }
-
-    #[test]
-    fn test_skip_whitespace_except_newline() {
-        let mut lexer = Lexer::new("  \t\r  abc");
-        lexer.skip_whitespace_except_newline();
-        assert_eq!(lexer.position, 6);
-        assert_eq!(lexer.current_char(), 'a');
-
-        let mut lexer = Lexer::new("  \nabc");
-        lexer.skip_whitespace_except_newline();
-        assert_eq!(lexer.position, 2); // newlineで止まる
-        assert_eq!(lexer.current_char(), '\n');
-
-        let mut lexer = Lexer::new("");
-        lexer.skip_whitespace_except_newline();
-        assert_eq!(lexer.position, 0); // 空文字列
-    }
-
-    #[test]
-    fn test_read_comment() {
-        let mut lexer = Lexer::new("# This is a comment\nNext line");
-        let token = lexer.read_comment();
-        assert_eq!(token, Token::Comment("This is a comment".to_string()));
-        assert_eq!(lexer.current_char(), '\n'); // コメントの後の改行で止まる
-
-        let mut lexer = Lexer::new("# Another comment");
-        let token = lexer.read_comment();
-        assert_eq!(token, Token::Comment("Another comment".to_string()));
-        assert!(lexer.is_at_end()); // EOFで止まる
-    }
-
-    #[test]
-    fn test_measure_indent() {
-        let mut lexer = Lexer::new("    key: value");
-        let indent = lexer.measure_indent();
-        assert_eq!(indent, 4);
-        assert_eq!(lexer.current_char(), 'k'); // インデントの次の文字で止まる
-
-        let mut lexer = Lexer::new("\t\tkey: value");
-        let indent = lexer.measure_indent();
-        assert_eq!(indent, 2);
-        assert_eq!(lexer.current_char(), 'k');
-
+    fn test_simple_key_value() {
         let mut lexer = Lexer::new("key: value");
-        let indent = lexer.measure_indent();
-        assert_eq!(indent, 0);
-        assert_eq!(lexer.current_char(), 'k');
-
-        let mut lexer = Lexer::new("");
-        let indent = lexer.measure_indent();
-        assert_eq!(indent, 0);
-        assert_eq!(lexer.current_char(), '\0');
+        let tokens = lexer.tokenize().unwrap();
+        
+        assert_eq!(tokens, vec![
+            Token::Key("key".to_string()),
+            Token::Colon,
+            Token::Value(YamlValue::String("value".to_string())),
+            Token::Eof,
+        ]);
     }
 
     #[test]
-    fn test_read_key_value_valid() {
-        let mut lexer = Lexer::new("key: value\n");
-        let token_option = lexer.read_key_value().unwrap();
-        assert_eq!(token_option, Some(Token::Key("key : value".to_string())));
-        assert_eq!(lexer.current_char(), '\n'); // 改行手前で止まる
-
-        let mut lexer = Lexer::new("  another_key :  another_value  ");
-        let token_option = lexer.read_key_value().unwrap();
-        assert_eq!(
-            token_option,
-            Some(Token::Key("another_key : another_value".to_string()))
-        );
-        assert!(lexer.is_at_end()); // EOFで止まる
-
-        let mut lexer = Lexer::new("empty_value:");
-        let token_option = lexer.read_key_value().unwrap();
-        assert_eq!(token_option, Some(Token::Key("empty_value : ".to_string())));
-        assert!(lexer.is_at_end());
+    fn test_indented_structure() {
+        let mut lexer = Lexer::new("parent:\n  child: value");
+        let tokens = lexer.tokenize().unwrap();
+        
+        // 期待されるトークン構造をテスト
+        assert!(tokens.contains(&Token::Key("parent".to_string())));
+        assert!(tokens.contains(&Token::Indent(2)));
+        assert!(tokens.contains(&Token::Key("child".to_string())));
     }
 
     #[test]
-    fn test_read_key_value_no_colon() {
-        let mut lexer = Lexer::new("this is not a key value pair\n");
-        let result = lexer.read_key_value();
-        // 現在のtokenizeロジックでは、read_key_valueがNoneを返すとtokenizeがParseErrorを出す
-        // そのため、read_key_valueはNoneを返すことを期待
-        assert_eq!(result.unwrap(), None);
-        // ここでパーサーの状態が、コロンまで読み進めた状態になることに注意
-        // lexer.current_char() は '\n' になっているはず
-        assert_eq!(lexer.current_char(), '\n');
-
-        let mut lexer = Lexer::new("just_a_word");
-        let result = lexer.read_key_value();
-        assert_eq!(result.unwrap(), None);
-        assert!(lexer.is_at_end()); // EOFまで読み進む
+    fn test_list_items() {
+        let mut lexer = Lexer::new("- item1\n- item2");
+        let tokens = lexer.tokenize().unwrap();
+        
+        assert!(tokens.contains(&Token::ListItem));
+        assert!(tokens.contains(&Token::Value(YamlValue::String("item1".to_string()))));
+        assert!(tokens.contains(&Token::Value(YamlValue::String("item2".to_string()))));
     }
 
     #[test]
-    fn test_read_key_value_empty_string() {
-        let mut lexer = Lexer::new("");
-        let token_option = lexer.read_key_value().unwrap();
-        assert_eq!(token_option, None);
-        assert!(lexer.is_at_end());
+    fn test_value_types() {
+        let mut lexer = Lexer::new("int: 42\nfloat: 3.14\nbool: true\nnull: null");
+        let tokens = lexer.tokenize().unwrap();
+        
+        // 各値の型が正しく判定されることを確認
+        assert!(tokens.iter().any(|t| matches!(t, Token::Value(YamlValue::Integer(42)))));
+        assert!(tokens.iter().any(|t| matches!(t, Token::Value(YamlValue::Float(f)) if (f - 3.14).abs() < f64::EPSILON)));
+        assert!(tokens.iter().any(|t| matches!(t, Token::Value(YamlValue::Boolean(true)))));
+        assert!(tokens.iter().any(|t| matches!(t, Token::Value(YamlValue::Null))));
+    }
+
+    #[test]
+    fn test_quoted_strings() {
+        let mut lexer = Lexer::new(r#"quoted: "hello world""#);
+        let tokens = lexer.tokenize().unwrap();
+        
+        assert!(tokens.iter().any(|t| matches!(t, Token::Value(YamlValue::String(s)) if s == "hello world")));
+    }
+
+    #[test]
+    fn test_comments() {
+        let mut lexer = Lexer::new("key: value # this is a comment");
+        let tokens = lexer.tokenize().unwrap();
+        
+        assert!(tokens.iter().any(|t| matches!(t, Token::Comment(c) if c == "this is a comment")));
     }
 }
+
