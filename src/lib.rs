@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::btree_map::Keys;
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -39,7 +40,8 @@ pub type Result<T> = std::result::Result<T, YamlError>;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
     Key(String),
-    Value(String),
+    Colon,
+    Value(YamlValue),
     String(String),
     ListItem,
     Indent(usize),
@@ -60,13 +62,8 @@ impl Lexer {
         Self {
             input: input.chars().collect(),
             position: 0,
-<<<<<<< HEAD
-            line:1,
-            column: 1
-=======
             line: 1,
             column: 1,
->>>>>>> 7215e6d432e597e6026abe9f005fee5dd0835869
         }
     }
 
@@ -116,6 +113,61 @@ impl Lexer {
             self.advance();
         }
         self.position - start_pos
+    }
+
+    fn read_string_until(&mut self, delimiters: &[char]) -> String {
+        let mut content = String::new();
+        while !delimiters.contains(&self.current_char())
+            && !matches!(self.current_char(), '\n' | '\0')
+        {
+            dbg!(self.current_char());
+            content.push(self.advance());
+        }
+        content.trim().to_string()
+    }
+
+    fn read_key(&mut self) -> Result<Token> {
+        let key = self.read_string_until(&[':']);
+        if key.len() > 0 {
+            Ok(Token::Key(key))
+        } else {
+            Err(YamlError::ParseError(format!(
+                "cannot parse at line: {}, column: {}",
+                self.line, self.column
+            )))
+        }
+    }
+
+    fn read_colon(&mut self) -> Result<Token> {
+        if self.current_char() == ':' {
+            self.advance();
+            Ok(Token::Colon)
+        } else {
+            Err(YamlError::ParseError(format!(
+                "cannot parse at line: {}, column: {}",
+                self.line, self.column
+            )))
+        }
+    }
+
+    fn read_value(&mut self) -> Result<Token> {
+        let value = self.read_string_until(&['#', '\n', '\0']);
+        if value.len() > 0 {
+            Ok(Token::Value(Self::parse_value(&value)))
+        } else {
+            Err(YamlError::ParseError("Failed to parse".to_string()))
+        }
+    }
+
+    fn parse_value(value: &str) -> YamlValue {
+        match value {
+            "true" => YamlValue::Boolean(true),
+            "false" => YamlValue::Boolean(false),
+            "null" | "~" => YamlValue::Null,
+            s if s.parse::<i64>().is_ok() => YamlValue::Integer(s.parse().unwrap()),
+            s if s.parse::<f64>().is_ok() => YamlValue::Float(s.parse().unwrap()),
+            s => YamlValue::String(s.to_string()),
+        }
     }
 
     fn read_key_value(&mut self) -> Result<Option<Token>> {
@@ -214,6 +266,38 @@ impl Lexer {
 #[cfg(test)]
 mod tests {
     use super::*; // 親モジュール（lib.rs）のアイテムをインポート
+
+    #[test]
+    fn test_read_string_until() {
+        let mut lexer = Lexer::new("hello: world");
+        assert_eq!(lexer.read_string_until(&[':']), "hello".to_string());
+        assert_eq!(lexer.advance(), ':');
+        assert_eq!(lexer.read_string_until(&['\0']), "world".to_string());
+    }
+
+    #[test]
+    fn test_read_key() {
+        let mut lexer = Lexer::new("hello: world");
+        assert_eq!(lexer.read_key().unwrap(), Token::Key("hello".to_string()));
+    }
+
+    #[test]
+    fn test_read_colon() {
+        let mut lexer = Lexer::new("hello: world");
+        assert_eq!(lexer.read_key().unwrap(), Token::Key("hello".to_string()));
+        assert_eq!(lexer.read_colon().unwrap(), Token::Colon);
+    }
+
+    #[test]
+    fn test_read_value() {
+        let mut lexer = Lexer::new("hello: world");
+        assert_eq!(lexer.read_key().unwrap(), Token::Key("hello".to_string()));
+        assert_eq!(lexer.read_colon().unwrap(), Token::Colon);
+        assert_eq!(
+            lexer.read_value().unwrap(),
+            Token::Value(YamlValue::String("world".to_string()))
+        );
+    }
 
     #[test]
     fn test_is_at_end() {
