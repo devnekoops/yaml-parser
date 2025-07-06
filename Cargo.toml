@@ -1,6 +1,15 @@
 [package]
 name = "yaml-parser"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+authors = ["Your Name <your.email@example.com>"]
+description = "A simple YAML parser with struct deserialization support"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/yourusername/yaml-parser"
+homepage = "https://github.com/yourusername/yaml-parser"
+documentation = "https://docs.rs/yaml-parser"
+keywords = ["yaml", "parser", "serde", "deserialization"]
+categories = ["parsing", "data-structures"]
+readme = "README.md"
 
 [dependencies]
